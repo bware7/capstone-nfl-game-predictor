@@ -9,9 +9,11 @@ source = { editable = "." }
 dependencies = [
     { name = "ipykernel" },
     { name = "ipython" },
+    { name = "joblib" },
     { name = "loguru" },
     { name = "matplotlib" },
     { name = "nfl-data-py" },
+    { name = "numpy" },
     { name = "pandas" },
     { name = "requests" },
     { name = "scikit-learn" },
@@ -41,6 +43,7 @@ dev = [
 requires-dist = [
     { name = "ipykernel" },
     { name = "ipython" },
+    { name = "joblib", specifier = ">=1.5.2" },
     { name = "livereload", marker = "extra == 'docs'" },
     { name = "loguru" },
     { name = "matplotlib" },
@@ -48,6 +51,7 @@ requires-dist = [
     { name = "mkdocs-material", marker = "extra == 'docs'" },
     { name = "mkdocstrings", extras = ["python"], marker = "extra == 'docs'" },
     { name = "nfl-data-py", specifier = ">=0.3.3" },
+    { name = "numpy", specifier = ">=1.26.4" },
     { name = "pandas" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
