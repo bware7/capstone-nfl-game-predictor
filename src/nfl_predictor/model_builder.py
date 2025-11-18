@@ -1,252 +1,374 @@
-"""NFL Prediction Model Building Module.
-
-This module handles model training, evaluation, and prediction
+"""
+NFL Game Predictor - Main Model Builder
+Consolidated version with data leakage prevention
 """
 
-import logging
-from typing import Any, Dict, Optional, Tuple
+import warnings
 
-import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-)
-from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.preprocessing import StandardScaler
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+warnings.filterwarnings('ignore')
+
+try:
+    import xgboost as xgb
+
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
+    print("XGBoost not installed. Install with: pip install xgboost")
 
 
-def build_prediction_model(
-    X: pd.DataFrame, y: pd.Series, test_size: float = 0.2, random_state: int = 42
-) -> dict[str, Any]:
-    """Build and train logistic regression model for NFL game prediction.
+class NFLGamePredictor:
+    """Main NFL game prediction model with data leakage prevention"""
 
-    Args:
-        X: Feature matrix
-        y: Target variable
-        test_size: Proportion of data for testing
-        random_state: Random seed for reproducibility
+    def __init__(self):
+        self.models = {}
+        self.scaler = StandardScaler()
+        self.best_model = None
+        self.feature_names = []
 
-    Returns:
-        Dictionary with model, metrics, and additional information
-    """
-    logger.info("Building prediction model...")
+        # Features that leak the target (must be excluded)
+        self.leaked_features = [
+            'home_won',
+            'home_team_won',
+            'winner',
+            'result',
+            'home_score',
+            'away_score',
+            'total',
+            'final_score',
+            'home_points',
+            'away_points',
+            'score_differential',
+            'home_score_differential',
+            'away_score_differential',
+            # EPA features are calculated post-game
+            'passing_epa',
+            'rushing_epa',
+            'receiving_epa',
+            'passing_epa_home_players',
+            'passing_epa_away_players',
+            'rushing_epa_home_players',
+            'rushing_epa_away_players',
+            'receiving_epa_home_players',
+            'receiving_epa_away_players',
+        ]
 
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
-    )
+    def load_data(
+        self,
+        game_data_path='data/games_with_features.csv',
+        player_stats_path='data/weekly_stats.csv',
+    ):
+        """Load game and player data"""
+        print("Loading data...")
 
-    logger.info(f"Training set size: {len(X_train)}")
-    logger.info(f"Test set size: {len(X_test)}")
+        # Load main game data
+        self.games_df = pd.read_csv(game_data_path)
+        print(f"  Loaded {len(self.games_df)} games")
 
-    # Scale features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+        # Try to load and merge player stats
+        try:
+            self.player_stats = pd.read_csv(player_stats_path)
+            self._merge_player_stats()
+        except:
+            print("  Player stats not available or couldn't be merged")
 
-    # Train model
-    model = LogisticRegression(random_state=random_state, max_iter=1000)
-    model.fit(X_train_scaled, y_train)
+        return self.games_df
 
-    # Make predictions
-    y_train_pred = model.predict(X_train_scaled)
-    y_test_pred = model.predict(X_test_scaled)
+    def _merge_player_stats(self):
+        """Aggregate and merge player statistics at team level"""
+        # Only use pre-game projectable stats
+        safe_stats = [
+            'completions',
+            'attempts',
+            'passing_yards',
+            'passing_tds',
+            'carries',
+            'rushing_yards',
+            'rushing_tds',
+            'targets',
+            'receptions',
+            'receiving_yards',
+            'receiving_tds',
+            'fantasy_points_ppr',
+        ]
 
-    # Calculate metrics
-    train_accuracy = accuracy_score(y_train, y_train_pred)
-    test_accuracy = accuracy_score(y_test, y_test_pred)
+        available_stats = [col for col in safe_stats if col in self.player_stats.columns]
+        if not available_stats:
+            return
 
-    # Calculate baseline (always predict home team wins)
-    baseline_accuracy = y_test.mean()
+        # Aggregate by team and week
+        team_stats = (
+            self.player_stats.groupby(['recent_team', 'season', 'week'])[available_stats]
+            .sum()
+            .reset_index()
+        )
 
-    # Detailed metrics
-    precision = precision_score(y_test, y_test_pred)
-    recall = recall_score(y_test, y_test_pred)
-    f1 = f1_score(y_test, y_test_pred)
+        # Merge for home and away teams
+        self.games_df = self.games_df.merge(
+            team_stats,
+            left_on=['home_team', 'season', 'week'],
+            right_on=['recent_team', 'season', 'week'],
+            how='left',
+            suffixes=('', '_home_players'),
+        ).merge(
+            team_stats,
+            left_on=['away_team', 'season', 'week'],
+            right_on=['recent_team', 'season', 'week'],
+            how='left',
+            suffixes=('', '_away_players'),
+        )
 
-    # Cross-validation
-    cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5)
+        print(f"  Merged {len(available_stats)} player statistics")
 
-    # Feature importance
-    feature_importance = pd.DataFrame(
-        {
-            'feature': X.columns,
-            'coefficient': model.coef_[0],
-            'abs_coefficient': np.abs(model.coef_[0]),
+    def prepare_features(self):
+        """Prepare features, excluding any that leak the target"""
+        print("\nPreparing features...")
+
+        # Get numeric columns
+        numeric_cols = self.games_df.select_dtypes(include=[np.number]).columns.tolist()
+
+        # Exclude leaked features and identifiers
+        exclude = self.leaked_features + [
+            'game_id',
+            'season',
+            'week',
+            'gameday',
+            'gametime',
+            'old_game_id',
+            'gsis',
+            'nfl_detail_id',
+            'pfr',
+            'pff',
+            'espn',
+            'ftn',
+            'recent_team',
+            'recent_team_home_players',
+            'recent_team_away_players',
+        ]
+
+        # Filter to safe features only
+        feature_cols = [col for col in numeric_cols if col not in exclude]
+
+        # Additional safety check - remove high correlation features
+        if 'home_won' in self.games_df.columns:
+            y = self.games_df['home_won']
+            safe_features = []
+            for col in feature_cols:
+                if col in self.games_df.columns:
+                    try:
+                        corr = abs(self.games_df[col].fillna(0).corr(y))
+                        if corr < 0.95:  # Keep only features with <95% correlation
+                            safe_features.append(col)
+                        elif corr >= 0.95:
+                            print(f"  Excluding '{col}' - too correlated ({corr:.3f})")
+                    except:
+                        safe_features.append(col)
+            feature_cols = safe_features
+
+        # Engineer additional features
+        self._engineer_features()
+
+        # Update feature list with engineered features
+        engineered = [
+            col for col in self.games_df.columns if col not in numeric_cols and col not in exclude
+        ]
+        feature_cols.extend(
+            [col for col in engineered if self.games_df[col].dtype in ['int64', 'float64']]
+        )
+
+        self.feature_names = feature_cols
+        print(f"  Using {len(feature_cols)} features")
+
+        # Prepare X and y
+        X = self.games_df[feature_cols].fillna(0)
+        y = self.games_df['home_won'].astype(int)
+
+        # Remove rows with missing target
+        valid_idx = ~y.isna()
+        X = X[valid_idx]
+        y = y[valid_idx]
+
+        print(f"  Final dataset: {X.shape}")
+        print(f"  Home win rate: {y.mean():.2%}")
+
+        return X, y
+
+    def _engineer_features(self):
+        """Engineer additional features from pre-game data"""
+        df = self.games_df
+
+        # Betting market features (if available)
+        if 'home_moneyline' in df.columns and 'away_moneyline' in df.columns:
+            # Convert moneyline to implied probability
+            df['home_implied_prob'] = df['home_moneyline'].apply(
+                lambda x: abs(x) / (abs(x) + 100) if x < 0 else 100 / (x + 100) if x > 0 else 0.5
+            )
+            df['away_implied_prob'] = df['away_moneyline'].apply(
+                lambda x: abs(x) / (abs(x) + 100) if x < 0 else 100 / (x + 100) if x > 0 else 0.5
+            )
+
+        # Rest advantage
+        if 'home_rest' in df.columns and 'away_rest' in df.columns:
+            df['rest_differential'] = df['home_rest'] - df['away_rest']
+
+        # Division game indicator
+        if 'div_game' in df.columns:
+            df['is_division'] = df['div_game'].astype(float)
+
+        # Season progress
+        if 'week' in df.columns:
+            df['season_progress'] = df['week'] / 18.0
+
+        # Player stats differentials (if available)
+        for stat in ['passing_yards', 'rushing_yards', 'receiving_yards', 'fantasy_points_ppr']:
+            home_col = f'{stat}_home_players'
+            away_col = f'{stat}_away_players'
+            if home_col in df.columns and away_col in df.columns:
+                df[f'{stat}_diff'] = df[home_col].fillna(0) - df[away_col].fillna(0)
+
+    def train_models(self, X, y):
+        """Train multiple models and select best performer"""
+        print("\nTraining models...")
+
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+
+        # Scale for logistic regression
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+
+        # Define models
+        models = {
+            'logistic_regression': LogisticRegression(random_state=42, max_iter=1000, C=0.5),
+            'random_forest': RandomForestClassifier(
+                n_estimators=100,
+                max_depth=8,
+                min_samples_split=10,
+                min_samples_leaf=5,
+                random_state=42,
+            ),
         }
-    ).sort_values('abs_coefficient', ascending=False)
 
-    # Confusion matrix
-    conf_matrix = confusion_matrix(y_test, y_test_pred)
+        if HAS_XGBOOST:
+            models['xgboost'] = xgb.XGBClassifier(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                random_state=42,
+                eval_metric='logloss',
+            )
 
-    # Prepare results
-    results = {
-        'model': model,
-        'scaler': scaler,
-        'train_accuracy': train_accuracy,
-        'test_accuracy': test_accuracy,
-        'baseline_accuracy': baseline_accuracy,
-        'improvement_over_baseline': test_accuracy - baseline_accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1_score': f1,
-        'cv_scores': cv_scores,
-        'cv_mean': cv_scores.mean(),
-        'cv_std': cv_scores.std(),
-        'feature_importance': feature_importance,
-        'confusion_matrix': conf_matrix,
-        'X_train': X_train,
-        'X_test': X_test,
-        'y_train': y_train,
-        'y_test': y_test,
-        'y_test_pred': y_test_pred,
-    }
+        # Train each model
+        results = {}
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-    # Print summary
-    print_model_summary(results)
+        for name, model in models.items():
+            # Use scaled data for logistic regression
+            if name == 'logistic_regression':
+                model.fit(X_train_scaled, y_train)
+                y_pred = model.predict(X_test_scaled)
+                cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=skf)
+            else:
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+                cv_scores = cross_val_score(model, X_train, y_train, cv=skf)
 
-    return results
+            acc = accuracy_score(y_test, y_pred)
+            results[name] = {
+                'model': model,
+                'test_acc': acc,
+                'cv_mean': cv_scores.mean(),
+                'cv_std': cv_scores.std(),
+                'predictions': y_pred,
+            }
+            self.models[name] = model
 
+            print(f"  {name}: {acc:.3f} (CV: {cv_scores.mean():.3f} ± {cv_scores.std():.3f})")
 
-def print_model_summary(results: Dict[str, Any]) -> None:
-    """Print comprehensive model summary.
+        # Create ensemble
+        if len(models) > 1:
+            ensemble = VotingClassifier(estimators=list(models.items()), voting='soft')
+            ensemble.fit(X_train, y_train)
+            y_pred = ensemble.predict(X_test)
+            cv_scores = cross_val_score(ensemble, X_train, y_train, cv=skf)
 
-    Args:
-        results: Dictionary with model results
-    """
-    print("\n" + "=" * 60)
-    print("MODEL PERFORMANCE SUMMARY")
-    print("=" * 60)
+            results['ensemble'] = {
+                'model': ensemble,
+                'test_acc': accuracy_score(y_test, y_pred),
+                'cv_mean': cv_scores.mean(),
+                'cv_std': cv_scores.std(),
+                'predictions': y_pred,
+            }
+            self.models['ensemble'] = ensemble
 
-    print(f"\nAccuracy Metrics:")
-    print(f"  Training Accuracy: {results['train_accuracy']:.4f}")
-    print(f"  Test Accuracy: {results['test_accuracy']:.4f}")
-    print(f"  Baseline (Home Win): {results['baseline_accuracy']:.4f}")
-    print(
-        f"  Improvement: {results['improvement_over_baseline']:.4f} "
-        f"({results['improvement_over_baseline'] / results['baseline_accuracy'] * 100:.1f}% relative)"
-    )
+            print(
+                f"  ensemble: {results['ensemble']['test_acc']:.3f} "
+                f"(CV: {cv_scores.mean():.3f} ± {cv_scores.std():.3f})"
+            )
 
-    print(f"\nDetailed Metrics:")
-    print(f"  Precision: {results['precision']:.4f}")
-    print(f"  Recall: {results['recall']:.4f}")
-    print(f"  F1-Score: {results['f1_score']:.4f}")
+        # Select best model
+        best_name = max(results, key=lambda x: results[x]['cv_mean'])
+        self.best_model = results[best_name]['model']
+        self.results = results
 
-    print(f"\nCross-Validation:")
-    print(f"  Mean CV Score: {results['cv_mean']:.4f} ± {results['cv_std']:.4f}")
+        print(f"\nBest model: {best_name} ({results[best_name]['cv_mean']:.3f})")
 
-    print(f"\nConfusion Matrix:")
-    print(results['confusion_matrix'])
+        return results, X_test, y_test
 
-    print(f"\nTop 5 Most Important Features:")
-    for idx, row in results['feature_importance'].head(5).iterrows():
-        print(f"  {row['feature']:30} : {row['coefficient']:+.4f}")
+    def get_feature_importance(self, top_n=10):
+        """Get feature importance from tree-based models"""
+        if 'random_forest' in self.models:
+            importance = pd.DataFrame(
+                {
+                    'feature': self.feature_names,
+                    'importance': self.models['random_forest'].feature_importances_,
+                }
+            ).sort_values('importance', ascending=False)
 
-    print("\n" + "=" * 60)
+            print(f"\nTop {top_n} important features:")
+            for _, row in importance.head(top_n).iterrows():
+                print(f"  {row['feature']}: {row['importance']:.4f}")
 
+            return importance
+        return None
 
-def evaluate_model(
-    model: Any, scaler: StandardScaler, X: pd.DataFrame, y: pd.Series
-) -> Dict[str, float]:
-    """Evaluate model on new data.
+    def evaluate(self, X_test, y_test):
+        """Generate evaluation report"""
+        print("\n" + "=" * 50)
+        print("MODEL EVALUATION")
+        print("=" * 50)
 
-    Args:
-        model: Trained model
-        scaler: Fitted StandardScaler
-        X: Features
-        y: True labels
+        baseline = 0.57  # Home field advantage
 
-    Returns:
-        Dictionary with evaluation metrics
-    """
-    X_scaled = scaler.transform(X)
-    y_pred = model.predict(X_scaled)
+        for name, result in self.results.items():
+            acc = result['test_acc']
+            improvement = (acc - baseline) / baseline * 100
+            print(f"\n{name}:")
+            print(f"  Accuracy: {acc:.3f}")
+            print(f"  CV Score: {result['cv_mean']:.3f} ± {result['cv_std']:.3f}")
+            print(f"  vs Baseline: +{improvement:.1f}%")
 
-    return {
-        'accuracy': accuracy_score(y, y_pred),
-        'precision': precision_score(y, y_pred),
-        'recall': recall_score(y, y_pred),
-        'f1_score': f1_score(y, y_pred),
-    }
+        best_acc = max(r['test_acc'] for r in self.results.values())
 
+        # Sanity check
+        if best_acc > 0.85:
+            print("\n⚠️ WARNING: Accuracy >85% is unusually high for NFL prediction")
+            print("  Consider checking for data leakage")
+        elif best_acc > 0.75:
+            print("\n✅ Good performance - near professional level")
+        elif best_acc > 0.65:
+            print("\n✅ Solid performance - better than baseline")
+        else:
+            print("\n💡 Room for improvement - consider more features")
 
-def predict_game(
-    model: Any, scaler: StandardScaler, game_features: pd.DataFrame
-) -> Tuple[int, float]:
-    """Predict single game outcome.
-
-    Args:
-        model: Trained model
-        scaler: Fitted StandardScaler
-        game_features: Features for one game
-
-    Returns:
-        Tuple of (prediction, probability)
-    """
-    features_scaled = scaler.transform(game_features)
-    prediction = model.predict(features_scaled)[0]
-    probability = model.predict_proba(features_scaled)[0, 1]
-
-    return int(prediction), float(probability)
-
-
-def save_model(results: Dict[str, Any], filepath: str = 'nfl_prediction_model.pkl') -> None:
-    """Save model and scaler to disk.
-
-    Args:
-        results: Model results dictionary
-        filepath: Path to save model
-    """
-    model_package = {
-        'model': results['model'],
-        'scaler': results['scaler'],
-        'feature_names': list(results['X_train'].columns),
-        'metrics': {
-            'test_accuracy': results['test_accuracy'],
-            'baseline_accuracy': results['baseline_accuracy'],
-            'f1_score': results['f1_score'],
-        },
-    }
-
-    joblib.dump(model_package, filepath)
-    logger.info(f"Model saved to {filepath}")
-
-
-def load_model(filepath: str = 'nfl_prediction_model.pkl') -> Dict[str, Any]:
-    """Load saved model from disk.
-
-    Args:
-        filepath: Path to model file
-
-    Returns:
-        Model package dictionary
-    """
-    return joblib.load(filepath)
-
-
-if __name__ == "__main__":
-    # Example usage
-    from src.nfl_predictor.data_collector import collect_nfl_data
-    from src.nfl_predictor.data_cleaner import prepare_data_for_modeling
-
-    # Collect and prepare data
-    games = collect_nfl_data([2023, 2024])
-    df_processed, X, y = prepare_data_for_modeling(games)
-
-    # Build model
-    results = build_prediction_model(X, y)
-
-    # Save model
-    save_model(results)
-
-    print("\nModel training completed successfully!")
+        return best_acc

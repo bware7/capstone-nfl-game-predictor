@@ -1,32 +1,57 @@
-"""NFL Game Predictor main execution."""
+"""
+NFL Game Predictor - Main Script
+Run this to train and evaluate the model
+"""
 
-from analytics_project.utils_logger import init_logger, logger
+import os
+import sys
 
-from .data_cleaner import create_game_features, prepare_training_data
-from .data_collector import get_games_data, save_data
-from .model_builder import train_model
+from data_preparer import DataPreparer
+import joblib
+from model_builder import NFLGamePredictor
 
 
 def main():
-    init_logger()
-    logger.info("Starting NFL Game Predictor")
+    """Main execution function"""
+    print("=" * 60)
+    print("NFL GAME PREDICTOR")
+    print("=" * 60)
 
-    # Get game data
-    games = get_games_data([2023, 2024])
+    # Check if data exists
+    if not os.path.exists('data/games_with_features.csv'):
+        print("\nNo data found. Collecting data...")
+        preparer = DataPreparer(seasons=[2023, 2024])
+        preparer.run_full_pipeline()
 
-    # Create features
-    games_with_features = create_game_features(games)
-    save_data(games_with_features, "games_with_features")
+    # Initialize predictor
+    predictor = NFLGamePredictor()
 
-    # Prepare for training
-    X, y = prepare_training_data(games_with_features)
+    # Load data
+    predictor.load_data(
+        game_data_path='data/games_with_features.csv', player_stats_path='data/weekly_stats.csv'
+    )
 
-    # Train model
-    model = train_model(X, y)
+    # Prepare features
+    X, y = predictor.prepare_features()
 
-    logger.info("Model training complete")
-    return 0
+    # Train models
+    results, X_test, y_test = predictor.train_models(X, y)
+
+    # Get feature importance
+    importance = predictor.get_feature_importance(top_n=10)
+
+    # Evaluate
+    best_accuracy = predictor.evaluate(X_test, y_test)
+
+    # Save best model
+    os.makedirs('models', exist_ok=True)
+    joblib.dump(predictor.best_model, 'models/nfl_predictor.pkl')
+    joblib.dump(predictor.scaler, 'models/scaler.pkl')
+    print("\n✅ Model saved to models/nfl_predictor.pkl")
+
+    return best_accuracy
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    accuracy = main()
+    print(f"\nFinal accuracy: {accuracy:.1%}")

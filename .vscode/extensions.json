@@ -31,10 +31,7 @@
     "ms-toolsai.jupyter-renderers",
 
     // YAML schema validation (great for GitHub Actions and configs)
-    "redhat.vscode-yaml",
-
-    // Enhanced Markdown editing (TOC, formatting, shortcuts)
-    "yzhang.markdown-all-in-one"
+    "redhat.vscode-yaml"
   ],
 
   "unwantedRecommendations": [
